@@ -5,6 +5,10 @@ changes that materially affect how an artifact is reproduced.
 
 ## [Unreleased]
 
+### Fixed and improved
+
+- On Android, turning on Bluetooth Peer asks for the Bluetooth permission when Ratspeak doesn't have it yet, instead of turning on and showing Bluetooth permission needed.
+
 ## [1.1.1] - 2026-11-17
 
 ### Added

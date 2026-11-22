@@ -1020,7 +1020,9 @@
     function enableBle() {
         RS.invoke('api_ble_peer_available').then(function(data) {
             window._blePeerAvailable = !!(data && data.available);
-            if (data && data.available) return true;
+            // Android reports Bluetooth as available while its permissions are
+            // still to be asked for; ask before switching on.
+            if (data && data.available && !data.permission_required) return true;
             var missing = (data && data.missing) || [];
             if (typeof hasAndroidBridge === 'function' && hasAndroidBridge() && typeof _ensureBlePermissions === 'function') return _ensureBlePermissions();
             if (typeof showToast === 'function') showToast(missing.length ? 'Bluetooth Peer isn’t available: ' + missing.join(', ') : 'Bluetooth Peer isn’t available. No Bluetooth adapter found.', 'toast-warning', 5000);
