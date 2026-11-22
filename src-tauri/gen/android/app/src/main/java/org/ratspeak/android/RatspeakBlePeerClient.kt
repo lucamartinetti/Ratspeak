@@ -38,6 +38,11 @@ import java.util.concurrent.atomic.AtomicBoolean
  *  - **Dual-service discovery** — a peer may expose either the Ratspeak
  *    service (preferred) or the Columba compatibility service. We try
  *    Ratspeak first.
+ *  - **ble-reticulum peripherals** — a Columba service that also has the
+ *    Identity characteristic belongs to a ble-reticulum peripheral (Columba,
+ *    RTNode). [connect] reads that characteristic, and Rust then runs the
+ *    protocol's identity handshake through [writeWithResponse]; the framing
+ *    and the keepalive are Rust's too (`ble_reticulum.rs` in rsReticulum).
  *
  * Why bypass btleplug here when btleplug already implements all of this on
  * desktop platforms? On Android 14+ btleplug's Java layer uses the
@@ -56,6 +61,8 @@ class RatspeakBlePeerClient(private val context: Context) {
         private const val TARGET_MTU = 517
         private const val MTU_FALLBACK_PAYLOAD = 20
         private const val GATT_TIMEOUT_SEC = 15L
+        private const val IDENTITY_READ_TIMEOUT_SEC = 5L
+        private const val WRITE_RESPONSE_TIMEOUT_SEC = 5L
         // Android refuses a write while its queue is full; retry like the RNode client.
         private const val WRITE_REJECT_RETRY_MS = 20L
         private const val WRITE_ENQUEUE_TIMEOUT_MS = 1_200L
@@ -87,6 +94,29 @@ class RatspeakBlePeerClient(private val context: Context) {
         @JvmStatic
         fun write(address: String, data: ByteArray): Boolean {
             return clients[address]?.writeRx(data) ?: false
+        }
+
+        /**
+         * Static dispatcher (Rust JNI) for a write the peer must acknowledge:
+         * forwards `data` to the RX characteristic of the client matching
+         * `address` as a GATT Write Request and waits for the response.
+         * Returns true once the peer has accepted it. Blocking; Rust calls it
+         * from `spawn_blocking`, before it starts the link's data writes.
+         */
+        @JvmStatic
+        fun writeWithResponse(address: String, data: ByteArray): Boolean {
+            return clients[address]?.writeRxWithResponse(data) ?: false
+        }
+
+        /**
+         * Identity characteristic of the peer at `address` (Rust JNI), read
+         * during [connect]. Null when the peer is not a ble-reticulum
+         * peripheral: it has the Ratspeak service, or a Columba service
+         * without that characteristic. Empty when the read failed.
+         */
+        @JvmStatic
+        fun peerIdentity(address: String): ByteArray? {
+            return clients[address]?.peerIdentity
         }
 
         /**
@@ -207,6 +237,10 @@ class RatspeakBlePeerClient(private val context: Context) {
     private var gatt: BluetoothGatt? = null
     private var rxChar: BluetoothGattCharacteristic? = null
     private var txChar: BluetoothGattCharacteristic? = null
+    // The Identity characteristic of a ble-reticulum peripheral, and its value
+    // once read. Both stay null for every other peer.
+    private var identityChar: BluetoothGattCharacteristic? = null
+    @Volatile internal var peerIdentity: ByteArray? = null
     @Volatile internal var negotiatedMtu = MTU_FALLBACK_PAYLOAD
     private var protocol: PeerProtocol = PeerProtocol.RATSPEAK
     private var address: String = ""
@@ -216,9 +250,14 @@ class RatspeakBlePeerClient(private val context: Context) {
     private var servicesLatch: CountDownLatch? = null
     private var descriptorLatch: CountDownLatch? = null
     private var mtuLatch: CountDownLatch? = null
+    private var identityLatch: CountDownLatch? = null
+    // Set only while a Write Request waits for its response; no-response
+    // writes get the same callback and must not release it.
+    @Volatile private var writeResponseLatch: CountDownLatch? = null
 
     private val connectStatus = AtomicBoolean(false)
     private val servicesStatus = AtomicBoolean(false)
+    private val writeResponseStatus = AtomicBoolean(false)
 
     private val handler = Handler(Looper.getMainLooper())
 
@@ -273,6 +312,22 @@ class RatspeakBlePeerClient(private val context: Context) {
                 cleanup(); return errFalse("Neither Ratspeak nor Columba service found")
             }
 
+            // ── Phase 3b: a ble-reticulum peripheral publishes its identity ──
+            identityChar?.let { identity ->
+                peerIdentity = ByteArray(0)
+                val latch = CountDownLatch(1)
+                identityLatch = latch
+                handler.post {
+                    val queued = try { gatt?.readCharacteristic(identity) == true }
+                    catch (e: Exception) { false }
+                    if (!queued) latch.countDown()
+                }
+                if (!latch.await(IDENTITY_READ_TIMEOUT_SEC, TimeUnit.SECONDS)) {
+                    Log.w(TAG, "Identity read timed out")
+                }
+                identityLatch = null
+            }
+
             // ── Phase 4: Subscribe to TX notifications ──
             descriptorLatch = CountDownLatch(1)
             val tx = txChar ?: run { cleanup(); return errFalse("TX characteristic missing") }
@@ -295,7 +350,11 @@ class RatspeakBlePeerClient(private val context: Context) {
             mtuLatch!!.await(5, TimeUnit.SECONDS)
 
             running.set(true)
-            Log.i(TAG, "=== PEER CONNECT SUCCESS === protocol=$protocol mtu=$negotiatedMtu")
+            Log.i(
+                TAG,
+                "=== PEER CONNECT SUCCESS === protocol=$protocol mtu=$negotiatedMtu" +
+                    " bleReticulum=${identityChar != null}"
+            )
             return true
 
         } catch (e: Exception) {
@@ -321,10 +380,54 @@ class RatspeakBlePeerClient(private val context: Context) {
             txChar = columba.getCharacteristic(COLUMBA_TX)
             if (rxChar != null && txChar != null) {
                 protocol = PeerProtocol.COLUMBA
+                // Ratspeak's own Columba-compatible service has no Identity
+                // characteristic; a ble-reticulum peripheral's has.
+                identityChar = columba.getCharacteristic(COLUMBA_ID)?.takeIf {
+                    it.properties and BluetoothGattCharacteristic.PROPERTY_READ != 0
+                }
                 return true
             }
         }
         return false
+    }
+
+    /**
+     * Write `data` to the peer's RX characteristic as a Write Request and wait
+     * for the peer's response. Returns true when the peer accepted the write.
+     * Runs on the caller's worker thread, and only while no other write is in
+     * flight: Android carries one GATT operation at a time.
+     */
+    fun writeRxWithResponse(data: ByteArray): Boolean {
+        if (!running.get()) return false
+        val rx = rxChar ?: return false
+        val g = gatt ?: return false
+        val latch = CountDownLatch(1)
+        writeResponseStatus.set(false)
+        writeResponseLatch = latch
+        try {
+            val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(WRITE_ENQUEUE_TIMEOUT_MS)
+            while (true) {
+                val accepted = try {
+                    writeCharacteristicCompat(g, rx, data, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
+                } catch (t: Throwable) {
+                    Log.w(TAG, "writeRxWithResponse failed: ${t.message}")
+                    return false
+                }
+                if (accepted) break
+                if (!running.get() || System.nanoTime() >= deadline) {
+                    Log.w(TAG, "writeRxWithResponse rejected len=${data.size}; giving up")
+                    return false
+                }
+                Thread.sleep(WRITE_REJECT_RETRY_MS)
+            }
+            if (!latch.await(WRITE_RESPONSE_TIMEOUT_SEC, TimeUnit.SECONDS)) {
+                Log.w(TAG, "writeRxWithResponse got no response len=${data.size}")
+                return false
+            }
+            return writeResponseStatus.get()
+        } finally {
+            writeResponseLatch = null
+        }
     }
 
     /**
@@ -378,7 +481,9 @@ class RatspeakBlePeerClient(private val context: Context) {
             try { gatt?.close() } catch (_: Exception) {}
             gatt = null
         }
-        rxChar = null; txChar = null
+        rxChar = null; txChar = null; identityChar = null
+        identityLatch?.countDown()
+        writeResponseLatch?.countDown()
     }
 
     fun isRunning(): Boolean = running.get()
@@ -427,6 +532,16 @@ class RatspeakBlePeerClient(private val context: Context) {
         }
     }
 
+    private fun handleCharacteristicRead(ch: BluetoothGattCharacteristic, data: ByteArray?, status: Int) {
+        if (ch.uuid != COLUMBA_ID) return
+        if (status == BluetoothGatt.GATT_SUCCESS && data != null) {
+            peerIdentity = data.copyOf()
+        } else {
+            Log.w(TAG, "Identity read failed: status=$status")
+        }
+        identityLatch?.countDown()
+    }
+
     private val gattCallback = object : BluetoothGattCallback() {
         override fun onConnectionStateChange(g: BluetoothGatt, status: Int, newState: Int) {
             Log.i(TAG, "GATT $address: status=$status state=$newState")
@@ -459,6 +574,28 @@ class RatspeakBlePeerClient(private val context: Context) {
 
         override fun onDescriptorWrite(g: BluetoothGatt, desc: BluetoothGattDescriptor, status: Int) {
             descriptorLatch?.countDown()
+        }
+
+        override fun onCharacteristicRead(
+            g: BluetoothGatt,
+            ch: BluetoothGattCharacteristic,
+            value: ByteArray,
+            status: Int
+        ) {
+            handleCharacteristicRead(ch, value, status)
+        }
+
+        @Suppress("DEPRECATION", "OVERRIDE_DEPRECATION")
+        override fun onCharacteristicRead(g: BluetoothGatt, ch: BluetoothGattCharacteristic, status: Int) {
+            // Android 13 and newer deliver the value through the overload above.
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) return
+            handleCharacteristicRead(ch, ch.value, status)
+        }
+
+        override fun onCharacteristicWrite(g: BluetoothGatt, ch: BluetoothGattCharacteristic, status: Int) {
+            val latch = writeResponseLatch ?: return
+            writeResponseStatus.set(status == BluetoothGatt.GATT_SUCCESS)
+            latch.countDown()
         }
 
         override fun onCharacteristicChanged(

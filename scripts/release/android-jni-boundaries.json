@@ -99,6 +99,8 @@
       "methods": [
         ["connectFromNative", "(Landroid/content/Context;Ljava/lang/String;)Z"],
         ["write", "(Ljava/lang/String;[B)Z"],
+        ["writeWithResponse", "(Ljava/lang/String;[B)Z"],
+        ["peerIdentity", "(Ljava/lang/String;)[B"],
         ["getMtu", "(Ljava/lang/String;)I"],
         ["disconnect", "(Ljava/lang/String;)V"],
         ["scanMesh", "(Landroid/content/Context;J)[Ljava/lang/String;"],

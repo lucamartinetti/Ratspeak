@@ -481,7 +481,7 @@ pub async fn api_ble_peer_status(state: State<'_, Arc<AppState>>) -> AppResult<V
 
     // Connected-peer snapshot so the UI can rebuild rows after a webview
     // reload instead of waiting for the next per-peer event.
-    let peers: Vec<Value> = state
+    let mut peers: Vec<Value> = state
         .ble_peers
         .lock()
         .map(|m| {
@@ -490,6 +490,13 @@ pub async fn api_ble_peer_status(state: State<'_, Arc<AppState>>) -> AppResult<V
                 .collect()
         })
         .unwrap_or_default();
+    // Reticulum nodes that named themselves over the link and are not one of
+    // the verified peers above.
+    peers.extend(
+        super::ble::ble_node_links()
+            .into_iter()
+            .map(|(address, node)| json!({ "address": address, "node_identity_hash": node })),
+    );
 
     let mut body = json!({
         "enabled": enabled,

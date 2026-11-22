@@ -547,6 +547,60 @@ fn verified_ble_peer_rows(
         .collect()
 }
 
+/// Live links to Reticulum nodes that named themselves in the ble-reticulum
+/// handshake (an RTNode, a Columba phone) and have not announced a messaging
+/// identity over the link: BLE address → node identity. The name is the
+/// node's own claim. It labels a relay in the Network view and never makes a
+/// messaging peer.
+#[cfg(any(feature = "ble", test))]
+fn ble_node_rows(
+    address_to_identity: &std::collections::HashMap<String, String>,
+    node_identity_by_address: &std::collections::HashMap<String, String>,
+) -> std::collections::BTreeMap<String, String> {
+    node_identity_by_address
+        .iter()
+        .filter(|(address, node)| {
+            is_valid_identity_hash_hex(node)
+                && !address_to_identity
+                    .get(*address)
+                    .is_some_and(|identity| is_valid_identity_hash_hex(identity))
+        })
+        .map(|(address, node)| (address.clone(), node.clone()))
+        .collect()
+}
+
+/// What the Bluetooth Peer card counts: verified messaging peers, and nodes
+/// that are not one of them.
+#[cfg(any(feature = "ble", test))]
+fn visible_ble_peer_count(
+    address_to_identity: &std::collections::HashMap<String, String>,
+    node_identity_by_address: &std::collections::HashMap<String, String>,
+) -> usize {
+    logical_ble_peer_count(address_to_identity)
+        + ble_node_rows(address_to_identity, node_identity_by_address)
+            .values()
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+}
+
+/// Snapshot of [`ble_node_rows`] for `api_ble_peer_status`, so node rows
+/// survive a webview reload. The event relay task writes it.
+static BLE_NODE_LINKS: std::sync::Mutex<std::collections::BTreeMap<String, String>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+pub(crate) fn ble_node_links() -> std::collections::BTreeMap<String, String> {
+    BLE_NODE_LINKS
+        .lock()
+        .map(|links| links.clone())
+        .unwrap_or_default()
+}
+
+pub(crate) fn clear_ble_node_links() {
+    if let Ok(mut links) = BLE_NODE_LINKS.lock() {
+        links.clear();
+    }
+}
+
 #[cfg(any(feature = "ble", test))]
 fn ble_retry_owns_connection(
     generations: &std::collections::HashMap<String, u64>,
@@ -1042,6 +1096,11 @@ fn spawn_enable_ble_peer_task(
                         // connection identity-addressable and message-ready.
                         let mut address_to_identity: std::collections::HashMap<String, String> =
                             std::collections::HashMap::new();
+                        // What a ble-reticulum peripheral called itself, by address.
+                        let mut node_identity_by_address: std::collections::HashMap<
+                            String,
+                            String,
+                        > = std::collections::HashMap::new();
                         let mut provisional_identity_by_address = provisional_identities;
                         let verified_addresses = Arc::new(tokio::sync::RwLock::new(
                             std::collections::HashSet::<String>::new(),
@@ -1060,8 +1119,12 @@ fn spawn_enable_ble_peer_task(
                         fn store_logical_ble_peer_count(
                             state: &AppState,
                             address_to_identity: &std::collections::HashMap<String, String>,
+                            node_identity_by_address: &std::collections::HashMap<String, String>,
                         ) -> usize {
-                            let peer_count = logical_ble_peer_count(address_to_identity);
+                            let peer_count = visible_ble_peer_count(
+                                address_to_identity,
+                                node_identity_by_address,
+                            );
                             state
                                 .ble_peer_count
                                 .store(peer_count, std::sync::atomic::Ordering::Relaxed);
@@ -1070,15 +1133,23 @@ fn spawn_enable_ble_peer_task(
                             if let Ok(mut peers) = state.ble_peers.lock() {
                                 *peers = verified_ble_peer_rows(address_to_identity);
                             }
+                            if let Ok(mut links) = BLE_NODE_LINKS.lock() {
+                                *links =
+                                    ble_node_rows(address_to_identity, node_identity_by_address);
+                            }
                             peer_count
                         }
 
                         fn emit_logical_ble_peer_status(
                             state: &AppState,
                             address_to_identity: &std::collections::HashMap<String, String>,
+                            node_identity_by_address: &std::collections::HashMap<String, String>,
                         ) {
-                            let peer_count =
-                                store_logical_ble_peer_count(state, address_to_identity);
+                            let peer_count = store_logical_ble_peer_count(
+                                state,
+                                address_to_identity,
+                                node_identity_by_address,
+                            );
                             let state_name = if peer_count > 0 {
                                 rns_interface::ble_peer::PeerState::On
                             } else {
@@ -1111,9 +1182,17 @@ fn spawn_enable_ble_peer_task(
                                 }
                                 BlePeerEvent::Connected {
                                     address,
-                                    identity_hash: _,
+                                    identity_hash: node_identity_hash,
                                     protocol,
                                 } => {
+                                    // The link layer's name for the node on the
+                                    // other end, never a messaging identity.
+                                    if is_valid_identity_hash_hex(&node_identity_hash) {
+                                        node_identity_by_address
+                                            .insert(address.clone(), node_identity_hash);
+                                    } else {
+                                        node_identity_by_address.remove(&address);
+                                    }
                                     let fresh_connection = {
                                         let mut connected = connected_addresses.write().await;
                                         let mut verified = verified_addresses.write().await;
@@ -1135,6 +1214,7 @@ fn spawn_enable_ble_peer_task(
                                     emit_logical_ble_peer_status(
                                         &state_relay,
                                         &address_to_identity,
+                                        &node_identity_by_address,
                                     );
                                     let provisional_identity_hash = provisional_identity_by_address
                                         .get(&address)
@@ -1146,12 +1226,17 @@ fn spawn_enable_ble_peer_task(
                                         .unwrap_or_default();
                                     let routable =
                                         is_valid_identity_hash_hex(&resolved_identity_hash);
+                                    let node_identity_hash = node_identity_by_address
+                                        .get(&address)
+                                        .cloned()
+                                        .unwrap_or_default();
                                     state_relay.emit_to_all(
                                         "ble_peer_connected",
                                         json!({
                                             "address": address,
                                             "identity_hash": resolved_identity_hash,
                                             "provisional_identity_hash": provisional_identity_hash,
+                                            "node_identity_hash": node_identity_hash,
                                             "readiness": if routable { "routable" } else { "connected" },
                                             "routable": routable,
                                             "protocol": protocol,
@@ -1162,6 +1247,7 @@ fn spawn_enable_ble_peer_task(
                                     connected_addresses.write().await.remove(&address);
                                     verified_addresses.write().await.remove(&address);
                                     connection_generations.write().await.remove(&address);
+                                    node_identity_by_address.remove(&address);
                                     let identity_hash = address_to_identity
                                         .remove(&address)
                                         .filter(|value| is_valid_identity_hash_hex(value));
@@ -1216,6 +1302,7 @@ fn spawn_enable_ble_peer_task(
                                     emit_logical_ble_peer_status(
                                         &state_relay,
                                         &address_to_identity,
+                                        &node_identity_by_address,
                                     );
                                     state_relay.emit_to_all(
                                         "ble_peer_disconnected",
@@ -1281,6 +1368,7 @@ fn spawn_enable_ble_peer_task(
                                     emit_logical_ble_peer_status(
                                         &state_relay,
                                         &address_to_identity,
+                                        &node_identity_by_address,
                                     );
                                     let db = state_relay.db.clone();
                                     let address_for_persist = address.clone();
@@ -1357,6 +1445,7 @@ fn spawn_enable_ble_peer_task(
                                         emit_logical_ble_peer_status(
                                             &state_relay,
                                             &address_to_identity,
+                                            &node_identity_by_address,
                                         );
                                     }
                                     _ => {
@@ -1388,6 +1477,10 @@ fn spawn_enable_ble_peer_task(
                                         continue;
                                     };
                                     state_relay.bump_announce_interface_revision();
+                                    // A relay never answers with an announce
+                                    // of its own, so it gets one announce, not
+                                    // the retries; each one costs it airtime.
+                                    let node_link = node_identity_by_address.contains_key(&address);
                                     tokio::spawn(async move {
                                         for delay_secs in BLE_IDENTITY_ANNOUNCE_RETRY_DELAYS_SECS {
                                             if delay_secs > 0 {
@@ -1415,6 +1508,9 @@ fn spawn_enable_ble_peer_task(
                                                     peer = %address,
                                                     "Bluetooth Peer identity announce covered"
                                                 );
+                                                if node_link {
+                                                    return;
+                                                }
                                             } else {
                                                 tracing::debug!(
                                                     peer = %address,
@@ -1432,6 +1528,7 @@ fn spawn_enable_ble_peer_task(
                                             )
                                         };
                                         if generation_is_current
+                                            && !node_link
                                             && connected.read().await.contains(&address)
                                             && !verified.read().await.contains(&address)
                                         {
@@ -2848,6 +2945,41 @@ mod tests {
         let rows = verified_ble_peer_rows(&peers);
         assert_eq!(rows.len(), 2);
         assert!(rows.iter().all(|(_, identity)| !identity.is_empty()));
+    }
+
+    #[test]
+    fn ble_nodes_are_counted_beside_verified_peers_and_never_as_them() {
+        let node = "22222222222222222222222222222222".to_string();
+        let peers = std::collections::HashMap::from([
+            ("relay".to_string(), String::new()),
+            ("unverified".to_string(), String::new()),
+            (
+                "phone".to_string(),
+                "11111111111111111111111111111111".to_string(),
+            ),
+        ]);
+        let nodes = std::collections::HashMap::from([
+            ("relay".to_string(), node.clone()),
+            // A phone that named itself and then announced is a peer, not a node.
+            (
+                "phone".to_string(),
+                "33333333333333333333333333333333".to_string(),
+            ),
+            ("malformed".to_string(), "not-a-hash".to_string()),
+        ]);
+
+        assert_eq!(
+            ble_node_rows(&peers, &nodes),
+            std::collections::BTreeMap::from([("relay".to_string(), node)])
+        );
+        assert_eq!(visible_ble_peer_count(&peers, &nodes), 2);
+        // The node's name never reaches the verified rows.
+        assert_eq!(logical_ble_peer_count(&peers), 1);
+        assert_eq!(verified_ble_peer_rows(&peers).len(), 1);
+        assert_eq!(
+            visible_ble_peer_count(&peers, &std::collections::HashMap::new()),
+            1
+        );
     }
 
     #[test]

@@ -564,6 +564,11 @@ function classifyInterface(iface) {
 // The visible Network section collapses rows by resolved identity because a
 // symmetric BLE peering can briefly expose central+peripheral GATT paths for
 // the same Ratspeak peer.
+//
+// A ble-reticulum peripheral (an RTNode, a Columba phone) names itself in its
+// Bluetooth handshake: `node_identity_hash`. That name is the node's own
+// claim, so it labels a relay row and never stands in for `identity_hash`,
+// the messaging identity only a signed announce gives.
 window._blePeers = window._blePeers || {};
 
 // Identity-aware label. A BLE address is transport metadata, never a peer
@@ -579,6 +584,13 @@ function _resolveBlePeerLabel(peer) {
             }
         }
         return { label: typeof shortHash === 'function' ? shortHash(idHash, 8, 4) : idHash.substring(0, 12) + '\u2026', title: idHash };
+    }
+    var node = peer.node_identity_hash || '';
+    if (node) {
+        return {
+            label: 'Reticulum node ' + (typeof shortHash === 'function' ? shortHash(node, 8, 4) : node.substring(0, 12) + '\u2026'),
+            title: 'Named by its Bluetooth handshake, not verified'
+        };
     }
     var provisional = peer.provisional_identity_hash || '';
     if (provisional && typeof PeersCache !== 'undefined' && PeersCache && typeof PeersCache.get === 'function') {
@@ -608,27 +620,30 @@ function _betterBlePeerRepresentative(current, candidate) {
     return (candidate.connected_at || 0) >= (current.connected_at || 0) ? candidate : current;
 }
 
+// A verified messaging peer, or a Reticulum node that is not one (yet).
+function _blePeerIsVisible(p) {
+    if (!p || p.connected !== true) return false;
+    if (p.routable === true && !!p.identity_hash) return true;
+    return !p.identity_hash && !!p.node_identity_hash;
+}
+
 function _bleVisiblePeersFromCache() {
     var raw = Object.keys(window._blePeers || {})
         .map(function(k) { return window._blePeers[k]; })
-        .filter(function(p) {
-            return p && p.connected === true && p.routable === true && !!p.identity_hash;
-        });
+        .filter(_blePeerIsVisible);
     var byIdentity = {};
-    var unidentified = [];
+    var byNode = {};
 
     raw.forEach(function(peer) {
         var id = peer.identity_hash || '';
-        if (!id) {
-            unidentified.push(Object.assign({}, peer, { addresses: [peer.address] }));
-            return;
+        var groups = id ? byIdentity : byNode;
+        var key = id || peer.node_identity_hash;
+        if (!groups[key]) {
+            groups[key] = { peer: null, addresses: [] };
         }
-        if (!byIdentity[id]) {
-            byIdentity[id] = { peer: null, addresses: [] };
-        }
-        byIdentity[id].peer = _betterBlePeerRepresentative(byIdentity[id].peer, peer);
-        if (peer.address && byIdentity[id].addresses.indexOf(peer.address) === -1) {
-            byIdentity[id].addresses.push(peer.address);
+        groups[key].peer = _betterBlePeerRepresentative(groups[key].peer, peer);
+        if (peer.address && groups[key].addresses.indexOf(peer.address) === -1) {
+            groups[key].addresses.push(peer.address);
         }
     });
 
@@ -638,7 +653,12 @@ function _bleVisiblePeersFromCache() {
         peer.identity_hash = id;
         peer.addresses = group.addresses.slice();
         return peer;
-    }).concat(unidentified);
+    }).concat(Object.keys(byNode).map(function(node) {
+        var group = byNode[node];
+        var peer = Object.assign({}, group.peer || {});
+        peer.addresses = group.addresses.slice();
+        return peer;
+    }));
 
     // Ratspeak before Columba; most recent connect first within each.
     peers.sort(function(a, b) {

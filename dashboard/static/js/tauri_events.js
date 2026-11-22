@@ -599,8 +599,10 @@ if (typeof PeersCache !== 'undefined' && PeersCache && typeof PeersCache.subscri
     });
 }
 
-// Counts only signed-identity-verified peers. A live GATT connection is not
-// message-ready until its announce has authenticated the Reticulum identity.
+// Counts signed-identity-verified peers, and Reticulum nodes that named
+// themselves in the Bluetooth handshake. Any other live GATT connection is
+// not message-ready until its announce has authenticated the Reticulum
+// identity.
 function _bleConnectedPeerCount() {
     if (typeof window._bleVisiblePeersFromCache === 'function') {
         return window._bleVisiblePeersFromCache().length;
@@ -610,7 +612,11 @@ function _bleConnectedPeerCount() {
     var addrs = Object.keys(window._blePeers);
     for (var i = 0; i < addrs.length; i++) {
         var p = window._blePeers[addrs[i]];
-        if (!p || !p.connected || p.routable !== true) continue;
+        if (!p || !p.connected) continue;
+        if (p.routable !== true) {
+            if (!p.identity_hash && p.node_identity_hash) seenIdentities['node:' + p.node_identity_hash] = true;
+            continue;
+        }
         if (p.identity_hash) {
             seenIdentities[p.identity_hash] = true;
         }
@@ -691,7 +697,7 @@ RS.listen('ble_peer_connected', function(data) {
         prior.provisional_identity_hash || '';
     // Adopt the orphan identity only when exactly one is alive (avoids
     // mis-attribution when multiple peers rotate inside the TTL window).
-    if (!identity && !provisionalIdentity && window._bleOrphanIdentities.length === 1) {
+    if (!identity && !provisionalIdentity && !data.node_identity_hash && window._bleOrphanIdentities.length === 1) {
         provisionalIdentity = window._bleOrphanIdentities[0].identity_hash;
         window._bleOrphanIdentities = [];
     }
@@ -699,6 +705,7 @@ RS.listen('ble_peer_connected', function(data) {
         address: data.address,
         identity_hash: identity,
         provisional_identity_hash: provisionalIdentity,
+        node_identity_hash: data.node_identity_hash || '',
         readiness: identity ? 'routable' : (data.readiness || 'connected'),
         routable: !!identity && data.routable !== false,
         protocol: data.protocol || prior.protocol || 'Ratspeak',

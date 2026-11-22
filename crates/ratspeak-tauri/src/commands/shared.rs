@@ -826,6 +826,7 @@ pub(crate) async fn teardown_ble_peer_runtime(state: &Arc<AppState>) -> bool {
     if let Ok(mut peers) = state.ble_peers.lock() {
         peers.clear();
     }
+    super::ble::clear_ble_node_links();
     state.emit_to_all(
         "ble_peer_status_changed",
         json!({ "state": "off", "peer_count": 0 }),
