@@ -127,7 +127,7 @@
             var paused = !!window._blePeerPaused;
             if (!peers.length) conns.push({ id: 'ble:scan', name: 'Nobody found yet', kind: 'ble', scanning: !paused, status: paused ? 'paused' : 'up', tx: 0, rx: 0 });
             peers.forEach(function(p) {
-                conns.push({ id: 'ble:' + (p.identity_hash || p.address), name: typeof _resolveBlePeerLabel === 'function' ? _resolveBlePeerLabel(p).label : (p.address || 'Peer'),
+                conns.push({ id: 'ble:' + (p.identity_hash || (p.node_identity_hash ? 'node:' + p.node_identity_hash : p.address)), name: typeof _resolveBlePeerLabel === 'function' ? _resolveBlePeerLabel(p).label : (p.address || 'Peer'),
                     kind: 'ble', status: paused ? 'paused' : 'up', tx: 0, rx: 0, peer: p, since: p.connected_at || 0 });
             });
         }
@@ -386,7 +386,7 @@
     function sub(c) {
         var i = c.iface || {};
         if (c.kind === 'tcp') return c.pub && c.pub.group === 'official' ? 'Ratspeak server' : (i.target_host || '');
-        if (c.kind === 'ble') return 'Nearby by Bluetooth';
+        if (c.kind === 'ble') return c.peer && !c.peer.identity_hash && c.peer.node_identity_hash ? 'Relays by Bluetooth' : 'Nearby by Bluetooth';
         if (c.kind === 'local') return 'This Wi-Fi or wired network';
         if (c.kind === 'lora') return [radioMhz(i), radioVia(i)].filter(Boolean).join(' · ');
         if (c.kind === 'host') return i.listen_port ? 'Port ' + i.listen_port : '';

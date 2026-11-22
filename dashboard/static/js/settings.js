@@ -1229,13 +1229,18 @@ window.refreshBlePeerStatus = function() {
             data.peers.forEach(function(p) {
                 if (!p || !p.address) return;
                 var prior = window._blePeers[p.address] || {};
+                // A row with only `node_identity_hash` is a Reticulum node
+                // that named itself, not a verified messaging peer.
+                var identity = p.identity_hash || prior.identity_hash || '';
+                var node = p.node_identity_hash || prior.node_identity_hash || '';
                 window._blePeers[p.address] = {
                     address: p.address,
-                    identity_hash: p.identity_hash || prior.identity_hash || '',
+                    identity_hash: identity,
                     provisional_identity_hash: '',
-                    readiness: 'routable',
-                    routable: true,
-                    protocol: prior.protocol || 'Ratspeak',
+                    node_identity_hash: node,
+                    readiness: identity ? 'routable' : 'connected',
+                    routable: !!identity,
+                    protocol: prior.protocol || (identity || !node ? 'Ratspeak' : 'Columba'),
                     rssi: prior.rssi,
                     connected: true,
                     connected_at: prior.connected_at || Date.now(),

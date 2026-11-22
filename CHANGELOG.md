@@ -5,6 +5,10 @@ changes that materially affect how an artifact is reproduced.
 
 ## [Unreleased]
 
+### Added
+
+- **RTNode over Bluetooth** (Android, Linux, Windows): Bluetooth Peer connects to RTNode radios, and to other devices that speak the ble-reticulum protocol, such as Columba, when they advertise it. A node it connects to shows in Network as Reticulum node with the name the node gave, which is not verified. Someone reached through the node is listed as before, once their announce arrives. Not yet on iPhone, iPad, or Mac.
+
 ## [1.1.1] - 2026-11-17
 
 ### Added
